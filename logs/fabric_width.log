@@ -1,0 +1,29 @@
+{"ts": "2026-02-21T12:55:19", "ms": 40, "level": "INFO", "logger": "root", "msg": "Logging initialised"}
+{"ts": "2026-02-21T12:55:19", "ms": 41, "level": "INFO", "logger": "__main__", "msg": "Python 3.11.9 | PID 26180"}
+{"ts": "2026-02-21T12:55:19", "ms": 44, "level": "INFO", "logger": "__main__", "msg": "=== Fabric Width Measurement System starting ==="}
+{"ts": "2026-02-21T12:55:19", "ms": 44, "level": "INFO", "logger": "__main__", "msg": "Mode: DRY-RUN (synthetic)"}
+{"ts": "2026-02-21T12:55:19", "ms": 61, "level": "INFO", "logger": "measurement", "msg": "[left] WidthMeasurer ready | fov=1000 mm | warp=2048x256 | 0.488 mm/px | strip_h=40"}
+{"ts": "2026-02-21T12:55:19", "ms": 63, "level": "INFO", "logger": "measurement", "msg": "[right] WidthMeasurer ready | fov=1000 mm | warp=2048x256 | 0.488 mm/px | strip_h=40"}
+{"ts": "2026-02-21T12:55:23", "ms": 161, "level": "ERROR", "logger": "mqtt_output", "msg": "MQTT initial connect failed: [WinError 10061] No connection could be made because the target machine actively refused it — will retry automatically."}
+{"ts": "2026-02-21T12:55:23", "ms": 168, "level": "INFO", "logger": "__main__", "msg": "All subsystems initialised successfully."}
+{"ts": "2026-02-21T12:55:23", "ms": 170, "level": "INFO", "logger": "camera", "msg": "[left] Synthetic camera started."}
+{"ts": "2026-02-21T12:55:23", "ms": 172, "level": "INFO", "logger": "camera", "msg": "[right] Synthetic camera started."}
+{"ts": "2026-02-21T12:55:23", "ms": 175, "level": "INFO", "logger": "watchdog", "msg": "Watchdog started [check=5.0s, kick_timeout=10.0s]"}
+{"ts": "2026-02-21T12:55:23", "ms": 175, "level": "INFO", "logger": "__main__", "msg": "Cameras and watchdog started."}
+{"ts": "2026-02-21T12:55:25", "ms": 176, "level": "INFO", "logger": "__main__", "msg": "Entering main loop | internal=25 Hz | output=5.0 Hz"}
+{"ts": "2026-02-21T12:55:28", "ms": 179, "level": "INFO", "logger": "watchdog", "msg": "Watchdog | OK | rate=0.00 Hz | mem=97.6 MB | cameras={'left': True, 'right': True}"}
+{"ts": "2026-02-21T12:55:28", "ms": 179, "level": "WARNING", "logger": "mqtt_output", "msg": "MQTT publish returned rc=4 on topic=fabric/health"}
+{"ts": "2026-02-21T12:55:33", "ms": 194, "level": "ERROR", "logger": "watchdog", "msg": "WATCHDOG ALERT [loop_stall]: Main loop stalled — no kick for 10.0s (timeout=10.0s)"}
+{"ts": "2026-02-21T12:55:33", "ms": 196, "level": "INFO", "logger": "watchdog", "msg": "Watchdog | DEGRADED | rate=0.00 Hz | mem=97.6 MB | cameras={'left': True, 'right': True}"}
+{"ts": "2026-02-21T12:55:33", "ms": 196, "level": "WARNING", "logger": "mqtt_output", "msg": "MQTT publish returned rc=4 on topic=fabric/health"}
+{"ts": "2026-02-21T12:55:38", "ms": 206, "level": "INFO", "logger": "watchdog", "msg": "Watchdog | DEGRADED | rate=0.00 Hz | mem=106.4 MB | cameras={'left': True, 'right': True}"}
+{"ts": "2026-02-21T12:55:38", "ms": 209, "level": "WARNING", "logger": "mqtt_output", "msg": "MQTT publish returned rc=4 on topic=fabric/health"}
+{"ts": "2026-02-21T12:55:43", "ms": 214, "level": "INFO", "logger": "watchdog", "msg": "Watchdog | DEGRADED | rate=0.00 Hz | mem=97.6 MB | cameras={'left': True, 'right': True}"}
+{"ts": "2026-02-21T12:55:43", "ms": 214, "level": "WARNING", "logger": "mqtt_output", "msg": "MQTT publish returned rc=4 on topic=fabric/health"}
+{"ts": "2026-02-21T12:55:48", "ms": 223, "level": "INFO", "logger": "watchdog", "msg": "Watchdog | DEGRADED | rate=0.00 Hz | mem=106.3 MB | cameras={'left': True, 'right': True}"}
+{"ts": "2026-02-21T12:55:48", "ms": 224, "level": "WARNING", "logger": "mqtt_output", "msg": "MQTT publish returned rc=4 on topic=fabric/health"}
+{"ts": "2026-02-21T12:55:51", "ms": 20, "level": "WARNING", "logger": "__main__", "msg": "Signal 2 received — initiating graceful shutdown …"}
+{"ts": "2026-02-21T12:55:51", "ms": 51, "level": "INFO", "logger": "__main__", "msg": "Teardown initiated …"}
+{"ts": "2026-02-21T12:55:51", "ms": 52, "level": "INFO", "logger": "watchdog", "msg": "Watchdog stopped."}
+{"ts": "2026-02-21T12:55:54", "ms": 441, "level": "INFO", "logger": "mqtt_output", "msg": "MQTT disconnected. published=0 connects=0"}
+{"ts": "2026-02-21T12:55:54", "ms": 442, "level": "INFO", "logger": "__main__", "msg": "=== Session complete | runtime=31.3 s | loops=613 | publishes=0 ==="}

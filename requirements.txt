@@ -1,0 +1,7 @@
+# Fabric Width Measurement System — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+opencv-python>=4.8.0
+numpy>=1.24.0
+paho-mqtt>=1.6.1
+psutil>=5.9.0
