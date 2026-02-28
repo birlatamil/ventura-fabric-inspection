@@ -35,10 +35,10 @@ Usage
 
 Checkerboard requirements
 -------------------------
-  Default: 9x6 inner corners, 25 mm square size.
+  Default: 10x9 inner corners, 25 mm square size.
   Override with --cols, --rows, --square-mm flags.
 
-Output JSON format
+Output JSON format 
 ------------------
   {
     "camera_matrix":      [[fx,0,cx],[0,fy,cy],[0,0,1]],
@@ -517,12 +517,12 @@ Examples:
         help="Right camera source. Default: 1",
     )
     shared.add_argument(
-        "--cols", type=int, default=9,
-        help="Chessboard inner corner columns (default: 9)",
+        "--cols", type=int, default=10,
+        help="Chessboard inner corner columns (default: 10)",
     )
     shared.add_argument(
-        "--rows", type=int, default=6,
-        help="Chessboard inner corner rows (default: 6)",
+        "--rows", type=int, default=9,
+        help="Chessboard inner corner rows (default: 9)",
     )
     shared.add_argument(
         "--camera", choices=["left", "right", "both"], default="both",
