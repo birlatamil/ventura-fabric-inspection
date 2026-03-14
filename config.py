@@ -19,7 +19,7 @@ class CameraConfig:
     reconnect_max_delay_s: float = 16.0
     frame_timeout_s: float = 0.5          # max age of a "live" frame
     cap_buffer_size: int = 1              # minimize OpenCV buffer to reduce latency
-    cap_api: int = 0                      # 0 = cv2.CAP_ANY
+    cap_api: int = 1900                   # 1900 = cv2.CAP_FFMPEG
 
 
 @dataclass
@@ -120,11 +120,11 @@ class LoggingConfig:
 class SystemConfig:
     """Root system configuration — single source of truth."""
     left_camera: CameraConfig = field(default_factory=lambda: CameraConfig(
-        rtsp_url="rtsp://admin:password@192.168.1.100:554/stream1",
+        rtsp_url="rtsp://172.32.0.93:554/live/0",
         name="left"
     ))
     right_camera: CameraConfig = field(default_factory=lambda: CameraConfig(
-        rtsp_url="rtsp://admin:password@192.168.1.101:554/stream1",
+        rtsp_url="rtsp://172.32.0.94:554/live/0",
         name="right"
     ))
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)

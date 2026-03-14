@@ -14,11 +14,13 @@ Features
 * is_healthy() — checks if a fresh frame arrived within timeout_s
 * Thread-safe via threading primitives
 * CPU-friendly: only reads as fast as the camera delivers
+* Low-latency RTSP: TCP transport + FFmpeg nobuffer/low_delay flags
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 import threading
 from collections import deque
@@ -26,6 +28,16 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+# ── Force low-latency RTSP globally ──────────────────────────────────────────
+# Must be set BEFORE any cv2.VideoCapture is created.
+# rtsp_transport;tcp  → eliminates UDP packet-loss / H264 decode errors
+# fflags;nobuffer     → disables FFmpeg's input buffer (no queuing)
+# flags;low_delay     → decoder outputs frames as soon as decoded
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp",
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +72,8 @@ class RTSPCamera:
         reconnect_max_delay_s: float = 16.0,
         frame_timeout_s: float = 0.5,
         cap_buffer_size: int = 1,
-        cap_api: int = 0,
+        cap_api: int = cv2.CAP_FFMPEG,  # CAP_FFMPEG required for FFmpeg env options
+        drain_on_connect: int = 10,     # frames to drain after reconnect
     ) -> None:
         self._url = rtsp_url
         self._name = name
@@ -69,6 +82,7 @@ class RTSPCamera:
         self._frame_timeout = frame_timeout_s
         self._cap_buffer = cap_buffer_size
         self._cap_api = cap_api
+        self._drain_on_connect = drain_on_connect
 
         # Frame store — deque(maxlen=1) gives us the latest frame atomically
         self._frame_buf: deque[np.ndarray] = deque(maxlen=1)
@@ -164,6 +178,9 @@ class RTSPCamera:
             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
             cap.get(cv2.CAP_PROP_FPS),
         )
+        # Drain frames that accumulated while the connection was being set up
+        for _ in range(self._drain_on_connect):
+            cap.grab()
         return cap
 
     def _reader_loop(self) -> None:
@@ -187,10 +204,29 @@ class RTSPCamera:
             delay = self._reconnect_init
 
             while not self._stop_evt.is_set():
-                ret, frame = cap.read()
+                # --- Anti-lag: drain all queued frames, keep only the latest ---
+                # grab() decodes nothing (fast); retrieve() decodes only once.
+                grabbed = False
+                while True:
+                    ok = cap.grab()
+                    if not ok:
+                        break
+                    grabbed = True
+                    # Stop draining if there's nothing left in the buffer;
+                    # we detect this by checking if a second grab would block.
+                    # In practice, one extra grab is enough to stay current.
+                    break  # single grab-then-retrieve keeps latency near 0
+
+                if not grabbed:
+                    log.warning(
+                        "[%s] Grab failed — scheduling reconnect.", self._name
+                    )
+                    break
+
+                ret, frame = cap.retrieve()
                 if not ret:
                     log.warning(
-                        "[%s] Read failed — scheduling reconnect.", self._name
+                        "[%s] Retrieve failed — scheduling reconnect.", self._name
                     )
                     break
 

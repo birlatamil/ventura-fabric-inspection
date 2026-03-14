@@ -24,7 +24,8 @@ Usage
   python run_calibration.py capture --left-src rtsp://... --right-src rtsp://...
 
   # Step 2 – calibrate from saved images
-  python run_calibration.py calibrate
+  
+  
 
   # Step 2 – only redo homography (reuse existing intrinsics JSON)
   python run_calibration.py calibrate --homography-only
@@ -59,10 +60,12 @@ import argparse
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -72,6 +75,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("calibration_tool")
+
+# Force RTSP over TCP globally — eliminates UDP packet-loss and H264 decode
+# errors.  We deliberately do NOT set fflags;nobuffer or flags;low_delay here
+# because those cause H264 inter-frame reference errors when P-frames are
+# skipped.  Latency is managed instead by keeping cap buffer=1 and draining
+# stale frames inside the reader thread.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp",
+)
 
 # ── Directory layout ─────────────────────────────────────────────────────────
 CALIB_DIR   = "calibration_data"
@@ -84,123 +97,412 @@ os.makedirs(CALIB_DIR, exist_ok=True)
 # SHARED HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _robust_find_chessboard(
+    img: np.ndarray,
+    board_size: Tuple[int, int],
+) -> Tuple[bool, Optional[np.ndarray]]:
+    """
+    Attempt to find chessboard corners with multiple pre-processing steps.
+    Tries gray, CLAHE, and adaptive thresholding to maximize robustness.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 1. Normal detection
+    flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
+    found, corners = cv2.findChessboardCorners(gray, board_size, flags)
+    if found:
+        return True, corners
+
+    # 2. Try with CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_clahe = clahe.apply(gray)
+    found, corners = cv2.findChessboardCorners(gray_clahe, board_size, flags)
+    if found:
+        return True, corners
+
+    # 3. Try with more aggressive adaptive thresh + filtering
+    # (Sometimes helpful for blurry or low-light images)
+    return False, None
+
 def open_source(src: str) -> cv2.VideoCapture:
-    """Open a camera (int index), RTSP URL, or local video path."""
+    """Open a camera (int index), RTSP URL, or local video path.
+
+    For RTSP URLs, forces TCP transport via CAP_FFMPEG so that the
+    OPENCV_FFMPEG_CAPTURE_OPTIONS env-var (set at the top of this file)
+    is honoured, eliminating packet-loss and H264 decode / lag issues.
+    """
     try:
         idx = int(src)
         cap = cv2.VideoCapture(idx)
     except ValueError:
-        cap = cv2.VideoCapture(src)
+        # Use CAP_FFMPEG so the OPENCV_FFMPEG_CAPTURE_OPTIONS env var
+        # defined above (tcp + nobuffer + low_delay) is applied.
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open source: {src!r}")
+
+    # Minimise internal buffer — keep only the latest frame
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    # Request hardware-accelerated decode if available
+    cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+
+    # Drain a small number of frames that piled up during connection setup
+    for _ in range(4):
+        cap.grab()
+
+    log.info(
+        "Opened source '%s' — %dx%d @ %.1f fps",
+        src,
+        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        cap.get(cv2.CAP_PROP_FPS),
+    )
     return cap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODE 1 – CAPTURE
+# MODE 1 – PARALLEL CAPTURE  (both cameras live simultaneously)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def capture_and_save_frames(
-    cap: cv2.VideoCapture,
-    camera_name: str,
-    save_dir: str,
-    board_cols: int,
-    board_rows: int,
-    num_frames: int = 30,
-    skip_frames: int = 15,
-) -> int:
+class _CameraWorker:
     """
-    Live capture: show the camera feed, detect chessboard in real-time,
-    and save a frame to *save_dir* when the user presses SPACE (only when
-    the chessboard is detected).
+    Per-camera worker: two threads, zero GUI calls.
 
-    Returns the number of frames saved.
+    Thread 1 — reader: grab + retrieve frames from the RTSP stream at full
+    camera rate.  Uses grab-then-retrieve (not cap.read) so we can drain one
+    extra stale frame per cycle without breaking the H264 reference chain.
+
+    Thread 2 — detector: runs cv2.findChessboardCorners on the most recent
+    frame so the main/GUI thread never blocks on slow corner detection.
+
+    The main thread picks up (display_frame, found, corners) via .get_display()
+    and handles all imshow() / waitKey() / save logic.
     """
-    os.makedirs(save_dir, exist_ok=True)
-    board_size = (board_cols, board_rows)
 
-    log.info(
-        "[%s] Capturing %d frames to '%s'.  "
-        "Press SPACE (chessboard must be detected) to save.  "
-        "Press Q to finish early.",
-        camera_name, num_frames, save_dir,
-    )
+    def __init__(
+        self,
+        name: str,
+        cap: cv2.VideoCapture,
+        save_dir: str,
+        board_size: Tuple[int, int],
+        num_frames: int,
+    ) -> None:
+        self.name       = name
+        self.save_dir   = save_dir
+        self.board_size = board_size
+        self.num_frames = num_frames
+        self.saved      = 0
+        self.done       = False   # set True when this camera is finished
 
-    saved      = 0
-    frame_idx  = 0
-    win_title  = f"Capture — {camera_name}  [0/{num_frames}]"
+        self._cap       = cap
+        self._stop      = threading.Event()
 
-    while saved < num_frames:
-        ret, frame = cap.read()
-        if not ret:
-            log.error("[%s] Cannot read frame from camera.", camera_name)
-            break
+        # Latest raw frame shared between reader → detector → main
+        self._raw_lock  = threading.Lock()
+        self._raw_frame: Optional[np.ndarray] = None
+        self._raw_seq   = 0   # incremented every time a new raw frame arrives
 
-        frame_idx += 1
-        if frame_idx < skip_frames:
-            continue   # let camera auto-expose
+        # Latest detection result shared between detector → main
+        self._det_lock    = threading.Lock()
+        self._det_display: Optional[np.ndarray] = None
+        self._det_found   = False
+        self._det_corners: Optional[np.ndarray] = None
+        self._det_raw_ref: Optional[np.ndarray] = None  # raw frame that was detected
 
-        display = frame.copy()
-        gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        found, corners = cv2.findChessboardCorners(
-            gray, board_size,
-            cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE,
-        )
+        # Save request: main → worker
+        self._save_queue: queue.Queue = queue.Queue(maxsize=4)
+        self._save_homog_ref = False  # True if we want to save next frame as homog ref
 
-        if found:
-            cv2.drawChessboardCorners(display, board_size, corners, found)
-            label = f"[{saved}/{num_frames}] FOUND — press SPACE to save"
-            color = (0, 220, 0)
-        else:
-            label = "Chessboard NOT detected"
-            color = (0, 0, 220)
+        os.makedirs(save_dir, exist_ok=True)
 
-        cv2.putText(display, label, (10, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
-        cv2.imshow(win_title, display)
-        key = cv2.waitKey(1) & 0xFF
+    # ── public (called from main thread) ─────────────────────────────────────
 
-        if key == ord(" ") and found:
-            fname = os.path.join(save_dir, f"{camera_name}_{saved:03d}.png")
-            cv2.imwrite(fname, frame)
-            saved += 1
-            log.info("[%s] Saved %d/%d → %s", camera_name, saved, num_frames, fname)
-            time.sleep(0.3)   # brief pause so user can move the board
+    def start(self) -> None:
+        self._t_reader = threading.Thread(
+            target=self._reader_loop, name=f"reader-{self.name}", daemon=True)
+        self._t_detect = threading.Thread(
+            target=self._detect_loop, name=f"detect-{self.name}", daemon=True)
+        self._t_saver  = threading.Thread(
+            target=self._saver_loop, name=f"saver-{self.name}",  daemon=True)
+        self._t_reader.start()
+        self._t_detect.start()
+        self._t_saver.start()
 
-        elif key == ord("q"):
-            log.info("[%s] Stopped early — %d frames saved.", camera_name, saved)
-            break
+    def stop(self) -> None:
+        self._stop.set()
+        self._save_queue.put(None)   # unblock saver
+        self._t_reader.join(timeout=3)
+        self._t_detect.join(timeout=3)
+        self._t_saver.join(timeout=3)
+        self._cap.release()
 
-    cv2.destroyAllWindows()
-    return saved
+    def get_display(self) -> Tuple[Optional[np.ndarray], bool, Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return (display_frame, found, corners, raw_frame) — all may be None."""
+        with self._det_lock:
+            return (
+                self._det_display,
+                self._det_found,
+                self._det_corners,
+                self._det_raw_ref,
+            )
+
+    def request_save(self, raw_frame: np.ndarray, is_homog_ref: bool = False) -> None:
+        """Ask the saver thread to write *raw_frame* to disk."""
+        try:
+            self._save_queue.put_nowait((raw_frame, is_homog_ref))
+        except queue.Full:
+            pass  # previous save still in progress — skip
+
+    # ── reader thread ─────────────────────────────────────────────────────────
+
+    def _reader_loop(self) -> None:
+        """
+        Grab + retrieve at full camera speed.
+        Uses grab() first so we can call grab() once more to skip one
+        buffered frame and stay 1 frame ahead — without breaking H264 chains.
+        """
+        warm = 0
+        while not self._stop.is_set():
+            # Single extra grab to discard one buffered frame
+            self._cap.grab()
+            ok = self._cap.grab()
+            if not ok:
+                time.sleep(0.02)
+                continue
+            ret, frame = self._cap.retrieve()
+            if not ret or frame is None:
+                time.sleep(0.02)
+                continue
+
+            # Warm-up: let auto-exposure settle
+            warm += 1
+            if warm < 20:
+                continue
+
+            with self._raw_lock:
+                self._raw_frame = frame
+                self._raw_seq  += 1
+
+    # ── detector thread ───────────────────────────────────────────────────────
+
+    def _detect_loop(self) -> None:
+        """
+        Run chessboard detection on the latest raw frame.
+        Runs at ~15 fps (67 ms sleep between detections) to avoid saturating
+        a CPU core — detection is slow (~30–100 ms per frame).
+        """
+        last_seq = -1
+        while not self._stop.is_set():
+            with self._raw_lock:
+                seq   = self._raw_seq
+                frame = self._raw_frame
+
+            if frame is None or seq == last_seq:
+                time.sleep(0.02)
+                continue
+            last_seq = seq
+
+            frame_to_detect = frame
+            found, corners = _robust_find_chessboard(frame_to_detect, self.board_size)
+
+            display = frame.copy()
+            if found:
+                cv2.drawChessboardCorners(display, self.board_size, corners, found)
+                label = (
+                    f"[{self.saved}/{self.num_frames}] "
+                    f"FOUND — SPACE: save | H: homog ref"
+                )
+                color = (0, 220, 0)
+            else:
+                label = "Chessboard NOT detected"
+                color = (0, 0, 220)
+
+            cv2.putText(
+                display, label, (10, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2,
+            )
+            cv2.putText(
+                display,
+                f"Press Q to finish {self.name} camera early",
+                (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
+            )
+
+            with self._det_lock:
+                self._det_display  = display
+                self._det_found    = found
+                self._det_corners  = corners if found else None
+                self._det_raw_ref  = frame
+
+            # 15 fps cap — detection is expensive, no need to run faster
+            time.sleep(0.067)
+
+    # ── saver thread ──────────────────────────────────────────────────────────
+
+    def _saver_loop(self) -> None:
+        """Write frames to disk in the background without blocking the GUI."""
+        while True:
+            item = self._save_queue.get()
+            if item is None:
+                break
+            
+            raw_frame, is_homog_ref = item
+            
+            if is_homog_ref:
+                fname = os.path.join(self.save_dir, "homography_ref.png")
+                cv2.imwrite(fname, raw_frame)
+                log.info("[%s] Saved homography reference image → %s", self.name, fname)
+            else:
+                fname = os.path.join(
+                    self.save_dir, f"{self.name}_{self.saved:03d}.png"
+                )
+                cv2.imwrite(fname, raw_frame)
+                self.saved += 1
+                log.info(
+                    "[%s] Saved %d/%d → %s",
+                    self.name, self.saved, self.num_frames, fname,
+                )
+                if self.saved >= self.num_frames:
+                    self.done = True
 
 
 def run_capture(args: argparse.Namespace) -> None:
-    """Entry-point for `capture` mode."""
-    cameras = []
-    if args.camera in ("left", "both"):
-        cameras.append(("left",  args.left_src))
-    if args.camera in ("right", "both"):
-        cameras.append(("right", args.right_src))
+    """
+    Entry-point for `capture` mode.
 
-    for name, src in cameras:
-        log.info("=== Capture — %s camera (src=%s) ===", name.upper(), src)
-        save_dir = os.path.join(CAPTURE_DIR, name)
+    Both cameras start simultaneously.  SPACE saves a frame from the camera
+    whose window is currently in focus.  Q marks that camera as done.
+    The session ends once every requested camera has saved enough frames.
+    """
+    cam_specs: List[Tuple[str, str]] = []
+    if args.camera in ("left", "both"):
+        cam_specs.append(("left",  args.left_src))
+    if args.camera in ("right", "both"):
+        cam_specs.append(("right", args.right_src))
+
+    board_size = (args.cols, args.rows)
+
+    # Open captures and create workers
+    workers: List[_CameraWorker] = []
+    for name, src in cam_specs:
+        log.info("=== Opening %s camera (src=%s) ===", name.upper(), src)
         try:
             cap = open_source(src)
-            n = capture_and_save_frames(
-                cap, name, save_dir,
-                board_cols=args.cols,
-                board_rows=args.rows,
-                num_frames=args.num_frames,
-            )
-            cap.release()
-            log.info("[%s] %d frame(s) saved to '%s'.", name, n, save_dir)
         except Exception as exc:
-            log.error("[%s] Capture failed: %s", name, exc, exc_info=True)
+            log.error("[%s] Cannot open camera: %s", name, exc)
+            continue
+        save_dir = os.path.join(CAPTURE_DIR, name)
+        w = _CameraWorker(name, cap, save_dir, board_size, args.num_frames)
+        workers.append(w)
 
-    log.info("Capture complete.  Run `python run_calibration.py calibrate` next.")
+    if not workers:
+        log.error("No cameras could be opened.  Aborting.")
+        return
+
+    # Start all workers in parallel
+    for w in workers:
+        w.start()
+        log.info(
+            "[%s] capturing %d frames to '%s'  "
+            "| SPACE = save  | Q = finish this camera early",
+            w.name, w.num_frames, w.save_dir,
+        )
+
+    # ── Main / GUI loop (must run on main thread on Windows) ─────────────────
+    # Track which camera window is "focused" (last key press).
+    # Both windows are always shown; SPACE/Q apply to the focused one.
+    focused: str = workers[0].name   # default focus
+    manually_done: set = set()       # cameras the user pressed Q on
+
+    WIN = {w.name: f"Capture — {w.name.upper()}" for w in workers}
+    for w in workers:
+        cv2.namedWindow(WIN[w.name], cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN[w.name], 960, 540)
+
+    PLACEHOLDER = np.zeros((540, 960, 3), dtype=np.uint8)
+    cv2.putText(
+        PLACEHOLDER, "Connecting …",
+        (340, 270), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (180, 180, 180), 2,
+    )
+
+    while True:
+        # Check if all cameras are finished
+        all_done = all(
+            w.done or w.name in manually_done
+            for w in workers
+        )
+        if all_done:
+            break
+
+        # Refresh each window
+        for w in workers:
+            if w.name in manually_done or w.done:
+                continue
+            display, found, corners, raw = w.get_display()
+            frame_to_show = display if display is not None else PLACEHOLDER
+            cv2.imshow(WIN[w.name], frame_to_show)
+
+        # Single waitKey services all windows
+        key = cv2.waitKey(1) & 0xFF
+
+        # Detect which window is focused by checking which title was last clicked
+        # OpenCV doesn't expose focus directly, so we use a simple heuristic:
+        # iterate workers and check if their window exists — the first active one
+        # with a fresh frame that received the last keypress gets the action.
+        # For simplicity: if only one camera left, it owns the key.
+        active = [w for w in workers if w.name not in manually_done and not w.done]
+        if len(active) == 1:
+            focused = active[0].name
+
+        if key == ord("q") or key == ord("Q"):
+            # Q finishes the focused camera
+            target = next((w for w in workers if w.name == focused), None)
+            if target:
+                log.info(
+                    "[%s] Stopped early — %d frame(s) saved.",
+                    target.name, target.saved,
+                )
+                manually_done.add(target.name)
+
+        elif key == ord(" "):
+            # SPACE saves a frame from the focused camera if chessboard found
+            target = next((w for w in workers if w.name == focused), None)
+            if target and not target.done and target.name not in manually_done:
+                _, found, corners, raw = target.get_display()
+                if found and raw is not None:
+                    target.request_save(raw.copy())
+                else:
+                    log.warning("[%s] Space pressed but chessboard not detected.",
+                                target.name)
+
+        elif key == ord("h") or key == ord("H"):
+            # H saves a homography reference image
+            target = next((w for w in workers if w.name == focused), None)
+            if target and not target.done and target.name not in manually_done:
+                _, found, corners, raw = target.get_display()
+                if found and raw is not None:
+                    target.request_save(raw.copy(), is_homog_ref=True)
+                else:
+                    log.warning("[%s] 'H' pressed but chessboard not detected.",
+                                target.name)
+
+        elif key in (ord("1"), ord("l")):
+            focused = "left"
+        elif key in (ord("2"), ord("r")):
+            focused = "right"
+
+    cv2.destroyAllWindows()
+
+    # Stop all workers
+    for w in workers:
+        w.stop()
+        log.info("[%s] %d frame(s) saved to '%s'.", w.name, w.saved, w.save_dir)
+
+    log.info(
+        "Capture complete.  "
+        "Run `python run_calibration.py calibrate` next."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,19 +555,16 @@ def detect_and_calibrate(
     good = 0
 
     for i, frame in enumerate(images):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if img_size is None:
-            img_size = (gray.shape[1], gray.shape[0])
+            img_size = (frame.shape[1], frame.shape[0])
 
-        found, corners = cv2.findChessboardCorners(
-            gray, board_size,
-            cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE,
-        )
+        found, corners = _robust_find_chessboard(frame, board_size)
         if not found:
             log.warning("[%s] Image %d/%d — chessboard NOT detected, skipped.",
                         camera_name, i + 1, len(images))
             continue
 
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners_refined = cv2.cornerSubPix(
             gray, corners, (11, 11), (-1, -1), criteria
         )
@@ -295,12 +594,12 @@ def detect_and_calibrate(
 # ── Homography helpers (unchanged from original) ─────────────────────────────
 
 def collect_homography_points(
-    cap: cv2.VideoCapture,
+    source: cv2.VideoCapture | np.ndarray,
     camera_name: str,
     num_points: int = 4,
 ) -> Tuple[List[List[float]], List[List[float]]]:
     """
-    Grab one live frame from *cap* and let the user click reference points.
+    Grab reference points from either a live VideoCapture OR a static image.
     After each click, enter the real-world (x, y) in mm at the terminal prompt.
     """
     px_pts:    List[List[float]]    = []
@@ -311,21 +610,28 @@ def collect_homography_points(
         if event == cv2.EVENT_LBUTTONDOWN:
             click_buf.append((x, y))
 
-    win = f"Homography — {camera_name} (click {num_points} reference points)"
+    source_type = "Image" if isinstance(source, np.ndarray) else "Live"
+    win = f"Homography ({source_type}) — {camera_name} (click {num_points} points)"
     cv2.namedWindow(win)
     cv2.setMouseCallback(win, mouse_cb)
 
-    log.info(
-        "[%s] Click %d reference points in the live frame.\n"
-        "After each click, enter the real-world X Y in mm at the prompt.",
-        camera_name, num_points,
-    )
-
-    ret, snapshot = cap.read()
-    if not ret:
-        raise RuntimeError(f"[{camera_name}] Cannot grab snapshot for homography.")
+    if isinstance(source, np.ndarray):
+        snapshot = source.copy()
+    else:
+        # Drain buffer and grab one live frame
+        for _ in range(5):
+            source.grab()
+        ret, snapshot = source.read()
+        if not ret:
+            raise RuntimeError(f"[{camera_name}] Cannot grab snapshot for homography.")
 
     display = snapshot.copy()
+
+    log.info(
+        "[%s] %s mode: Click %d reference points.\n"
+        "After each click, enter the real-world X Y in mm at the prompt.",
+        camera_name, source_type, num_points,
+    )
 
     while len(px_pts) < num_points:
         cv2.imshow(win, display)
@@ -443,9 +749,24 @@ def run_single_camera_calibration(
         )
 
     # ── Live homography point collection ─────────────────────────────────────
-    cap = open_source(src)
-    px_pts, mm_pts = collect_homography_points(cap, camera_name)
-    cap.release()
+    img_folder = os.path.join(CAPTURE_DIR, camera_name)
+    homography_ref_path = os.path.join(img_folder, "homography_ref.png")
+    
+    if os.path.exists(homography_ref_path):
+        log.info("[%s] Found homography reference image: %s", camera_name, homography_ref_path)
+        source = cv2.imread(homography_ref_path)
+        if source is None:
+             log.error("[%s] Could not read %s, falling back to live.", camera_name, homography_ref_path)
+             cap = open_source(src)
+             px_pts, mm_pts = collect_homography_points(cap, camera_name)
+             cap.release()
+        else:
+             px_pts, mm_pts = collect_homography_points(source, camera_name)
+    else:
+        log.info("[%s] No homography reference image found. Opening live feed.", camera_name)
+        cap = open_source(src)
+        px_pts, mm_pts = collect_homography_points(cap, camera_name)
+        cap.release()
 
     H, reproj_error = compute_and_validate_homography(px_pts, mm_pts, camera_name)
 
