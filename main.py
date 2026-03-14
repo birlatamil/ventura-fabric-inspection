@@ -253,6 +253,7 @@ class FabricWidthSystem:
         self.left_measurer = WidthMeasurer(
             calib=self.left_calib,
             strip_height_px=m_cfg.strip_height_px,
+            raw_strip_height_px=m_cfg.raw_strip_height_px,
             sobel_ksize=m_cfg.sobel_ksize,
             sobel_threshold=m_cfg.sobel_threshold,
             subpixel_half_window=m_cfg.subpixel_half_window,
@@ -260,10 +261,15 @@ class FabricWidthSystem:
             fabric_min_mm=m_cfg.fabric_min_mm,
             fabric_max_mm=m_cfg.fabric_max_mm,
             min_confidence=m_cfg.min_confidence,
+            laser_mode=m_cfg.laser_mode,
+            laser_brightness_threshold=m_cfg.laser_brightness_threshold,
+            laser_min_width_frac=m_cfg.laser_min_width_frac,
+            laser_row_band=m_cfg.laser_row_band,
         )
         self.right_measurer = WidthMeasurer(
             calib=self.right_calib,
             strip_height_px=m_cfg.strip_height_px,
+            raw_strip_height_px=m_cfg.raw_strip_height_px,
             sobel_ksize=m_cfg.sobel_ksize,
             sobel_threshold=m_cfg.sobel_threshold,
             subpixel_half_window=m_cfg.subpixel_half_window,
@@ -271,6 +277,10 @@ class FabricWidthSystem:
             fabric_min_mm=m_cfg.fabric_min_mm,
             fabric_max_mm=m_cfg.fabric_max_mm,
             min_confidence=m_cfg.min_confidence,
+            laser_mode=m_cfg.laser_mode,
+            laser_brightness_threshold=m_cfg.laser_brightness_threshold,
+            laser_min_width_frac=m_cfg.laser_min_width_frac,
+            laser_row_band=m_cfg.laser_row_band,
         )
 
         # ── MQTT ───────────────────────────────────────────────────────────

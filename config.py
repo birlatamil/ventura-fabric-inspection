@@ -41,11 +41,17 @@ class CalibrationConfig:
 @dataclass
 class MeasurementConfig:
     """Measurement pipeline parameters."""
-    # Center strip extraction
+
+    # ── Raw-frame pre-crop (speedup) ────────────────────────────────────────
+    # Crop the raw camera frame to a horizontal strip centred on the laser
+    # BEFORE remap + warpPerspective.  Set to 0 to keep the full frame.
+    raw_strip_height_px: int = 120    # rows kept around the laser (0 = disabled)
+
+    # Center strip extraction (applied to the warped output)
     strip_height_px: int = 40         # number of rows to process
     strip_rows_per_line: int = 1      # step between sampled rows
 
-    # Sobel edge detection
+    # Sobel edge detection (used when laser_mode = False)
     sobel_ksize: int = 3
     sobel_threshold: float = 20.0     # minimum gradient to count as edge
 
@@ -71,6 +77,22 @@ class MeasurementConfig:
     # Right camera: covers 0..right_fov_mm_width
     left_fov_mm_width: float = 1000.0
     right_fov_mm_width: float = 1000.0
+
+    # ── Green laser line detection (monochrome B/W camera) ──────────────────
+    # When True the system locates the laser line and measures its horizontal
+    # extent instead of running Sobel-based edge detection.
+    laser_mode: bool = True
+
+    # Pixel brightness threshold (0-255) above which a pixel is considered
+    # part of the laser line.  Tune this with your actual camera exposure.
+    laser_brightness_threshold: int = 50
+
+    # Minimum fraction of the image width the laser must span for the
+    # measurement to be considered valid (sanity guard).
+    laser_min_width_frac: float = 0.10
+
+    # How many rows around the auto-detected laser row to average over.
+    laser_row_band: int = 5
 
 
 @dataclass
