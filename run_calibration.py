@@ -57,6 +57,7 @@ Output JSON format
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -75,6 +76,17 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("calibration_tool")
+
+# ── GPU / OpenCL availability ────────────────────────────────────────────────
+# cv2.UMat transparently offloads cvtColor, CLAHE, resize etc. to GPU via
+# OpenCL when available — no special build required.
+try:
+    _test = cv2.UMat(np.zeros((2, 2), dtype=np.uint8))
+    _USE_UMAT = True
+    log.info("OpenCL/UMat acceleration available — GPU will be used.")
+except Exception:
+    _USE_UMAT = False
+    log.info("OpenCL/UMat NOT available — falling back to CPU.")
 
 # Force RTSP over TCP globally — eliminates UDP packet-loss and H264 decode
 # errors.  We deliberately do NOT set fflags;nobuffer or flags;low_delay here
@@ -100,28 +112,68 @@ os.makedirs(CALIB_DIR, exist_ok=True)
 def _robust_find_chessboard(
     img: np.ndarray,
     board_size: Tuple[int, int],
+    *,
+    use_downscale_precheck: bool = True,
 ) -> Tuple[bool, Optional[np.ndarray]]:
     """
     Attempt to find chessboard corners with multiple pre-processing steps.
     Tries gray, CLAHE, and adaptive thresholding to maximize robustness.
+
+    Speed optimisations
+    -------------------
+    * **Downscaled pre-check** — run FAST_CHECK on a half-resolution copy
+      first; if no board is found there, skip the expensive full-res search.
+    * **UMat (OpenCL GPU)** — cvtColor and CLAHE are offloaded to the GPU
+      when available, freeing the CPU for other threads.
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
+    flags = (
+        cv2.CALIB_CB_ADAPTIVE_THRESH
+        + cv2.CALIB_CB_NORMALIZE_IMAGE
+        + cv2.CALIB_CB_FAST_CHECK
+    )
+
+    # ── Downscaled pre-check (fast reject) ───────────────────────────────
+    if use_downscale_precheck:
+        h, w = img.shape[:2]
+        small = cv2.resize(img, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+        small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        pre_found, _ = cv2.findChessboardCorners(small_gray, board_size, flags)
+        if not pre_found:
+            return False, None  # fast reject — no board visible
+
+    # ── Full-resolution detection (UMat accelerated when possible) ───────
+    if _USE_UMAT:
+        u_img = cv2.UMat(img)
+        u_gray = cv2.cvtColor(u_img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.UMat.get(u_gray)  # download for findChessboardCorners
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
     # 1. Normal detection
-    flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
     found, corners = cv2.findChessboardCorners(gray, board_size, flags)
     if found:
         return True, corners
 
     # 2. Try with CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_clahe = clahe.apply(gray)
+    if _USE_UMAT:
+        clahe = cv2.cuda.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) \
+            if hasattr(cv2, 'cuda') and hasattr(cv2.cuda, 'createCLAHE') \
+            else cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        try:
+            gray_clahe = clahe.apply(u_gray)
+            gray_clahe = cv2.UMat.get(gray_clahe)
+        except Exception:
+            clahe_cpu = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray_clahe = clahe_cpu.apply(gray)
+    else:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_clahe = clahe.apply(gray)
+
     found, corners = cv2.findChessboardCorners(gray_clahe, board_size, flags)
     if found:
         return True, corners
 
-    # 3. Try with more aggressive adaptive thresh + filtering
-    # (Sometimes helpful for blurry or low-light images)
+    # 3. No board found with any preprocessing
     return False, None
 
 def open_source(src: str) -> cv2.VideoCapture:
@@ -304,11 +356,14 @@ class _CameraWorker:
                 continue
             last_seq = seq
 
-            frame_to_detect = frame
-            found, corners = _robust_find_chessboard(frame_to_detect, self.board_size)
+            # Use downscaled pre-check for fast rejection in live mode
+            found, corners = _robust_find_chessboard(
+                frame, self.board_size, use_downscale_precheck=True,
+            )
 
-            display = frame.copy()
+            # Avoid a full .copy() when not found — only copy when we overlay
             if found:
+                display = frame.copy()
                 cv2.drawChessboardCorners(display, self.board_size, corners, found)
                 label = (
                     f"[{self.saved}/{self.num_frames}] "
@@ -316,6 +371,7 @@ class _CameraWorker:
                 )
                 color = (0, 220, 0)
             else:
+                display = frame  # no overlay needed, skip expensive copy
                 label = "Chessboard NOT detected"
                 color = (0, 0, 220)
 
@@ -335,8 +391,8 @@ class _CameraWorker:
                 self._det_corners  = corners if found else None
                 self._det_raw_ref  = frame
 
-            # 15 fps cap — detection is expensive, no need to run faster
-            time.sleep(0.067)
+            # Reduced sleep: GPU + downscale pre-check are fast enough
+            time.sleep(0.030)
 
     # ── saver thread ──────────────────────────────────────────────────────────
 
@@ -549,19 +605,40 @@ def detect_and_calibrate(
     objp = np.zeros((board_rows * board_cols, 3), np.float32)
     objp[:, :2] = np.mgrid[0:board_cols, 0:board_rows].T.reshape(-1, 2) * square_mm
 
+    img_size: Optional[Tuple[int, int]] = None
+    if images:
+        img_size = (images[0].shape[1], images[0].shape[0])
+
+    # ── Parallel chessboard detection ────────────────────────────────────
+    # Detect corners across all images concurrently using a thread pool.
+    # findChessboardCorners releases the GIL, so threads give a real
+    # speedup on multi-core CPUs (and UMat/OpenCL parallelism).
+    num_workers = min(len(images), os.cpu_count() or 4)
+    log.info(
+        "[%s] Detecting chessboard in %d images with %d parallel workers …",
+        camera_name, len(images), num_workers,
+    )
+
+    def _detect_one(idx_frame):
+        idx, frame = idx_frame
+        found, corners = _robust_find_chessboard(
+            frame, board_size, use_downscale_precheck=True,
+        )
+        return idx, found, corners, frame
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = pool.map(_detect_one, enumerate(images))
+        results = list(futures)
+
     obj_points: List[np.ndarray] = []
     img_points: List[np.ndarray] = []
-    img_size:   Optional[Tuple[int, int]] = None
     good = 0
 
-    for i, frame in enumerate(images):
-        if img_size is None:
-            img_size = (frame.shape[1], frame.shape[0])
-
-        found, corners = _robust_find_chessboard(frame, board_size)
+    for idx, found, corners, frame in results:
         if not found:
             log.warning("[%s] Image %d/%d — chessboard NOT detected, skipped.",
-                        camera_name, i + 1, len(images))
+                        camera_name, idx + 1, len(images))
             continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -572,7 +649,7 @@ def detect_and_calibrate(
         img_points.append(corners_refined)
         good += 1
         log.info("[%s] Image %d/%d — chessboard detected (%d usable so far).",
-                 camera_name, i + 1, len(images), good)
+                 camera_name, idx + 1, len(images), good)
 
     if good < 10:
         raise RuntimeError(

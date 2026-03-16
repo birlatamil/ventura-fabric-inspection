@@ -85,7 +85,7 @@ class MeasurementConfig:
 
     # Pixel brightness threshold (0-255) above which a pixel is considered
     # part of the laser line.  Tune this with your actual camera exposure.
-    laser_brightness_threshold: int = 50
+    laser_brightness_threshold: int = 245
 
     # Minimum fraction of the image width the laser must span for the
     # measurement to be considered valid (sanity guard).
@@ -99,7 +99,7 @@ class MeasurementConfig:
 class OutputConfig:
     """Output cadence config."""
     output_interval_s: float = 0.200  # 200 ms = 5 Hz
-    measurement_fps: int = 25         # target internal measurement loop rate
+    measurement_fps: int = 10        # target internal measurement loop rate
 
 
 @dataclass
