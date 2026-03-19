@@ -6,7 +6,7 @@ Edit this file to match your hardware setup before running.
 """
 
 from dataclasses import dataclass, field
-from typing import Tuple, List
+from typing import Optional, Tuple, List
 import os
 
 
@@ -45,7 +45,7 @@ class MeasurementConfig:
     # ── Raw-frame pre-crop (speedup) ────────────────────────────────────────
     # Crop the raw camera frame to a horizontal strip centred on the laser
     # BEFORE remap + warpPerspective.  Set to 0 to keep the full frame.
-    raw_strip_height_px: int = 120    # rows kept around the laser (0 = disabled)
+    raw_strip_height_px: int = 0      # rows kept around the laser (0 = disabled)
 
     # Center strip extraction (applied to the warped output)
     strip_height_px: int = 40         # number of rows to process
@@ -53,7 +53,7 @@ class MeasurementConfig:
 
     # Sobel edge detection (used when laser_mode = False)
     sobel_ksize: int = 3
-    sobel_threshold: float = 20.0     # minimum gradient to count as edge
+    sobel_threshold: float = 10.0     # minimum gradient to count as edge
 
     # Subpixel parabolic fit half-window
     subpixel_half_window: int = 2
@@ -62,11 +62,11 @@ class MeasurementConfig:
     moving_avg_window: int = 5        # frames
 
     # Fabric width validity range
-    fabric_min_mm: float = 800.0
+    fabric_min_mm: float = 10.0
     fabric_max_mm: float = 1900.0
 
     # Confidence: minimum SNR ratio to trust a measurement
-    min_confidence: float = 0.6
+    min_confidence: float = 0.1
 
     # Warped bird's-eye output image size (pixels) → represents mm space
     warp_output_width_px: int = 2048
@@ -85,11 +85,11 @@ class MeasurementConfig:
 
     # Pixel brightness threshold (0-255) above which a pixel is considered
     # part of the laser line.  Tune this with your actual camera exposure.
-    laser_brightness_threshold: int = 245
+    laser_brightness_threshold: int = 5
 
     # Minimum fraction of the image width the laser must span for the
     # measurement to be considered valid (sanity guard).
-    laser_min_width_frac: float = 0.10
+    laser_min_width_frac: float = 0.01
 
     # How many rows around the auto-detected laser row to average over.
     laser_row_band: int = 5
@@ -99,7 +99,7 @@ class MeasurementConfig:
 class OutputConfig:
     """Output cadence config."""
     output_interval_s: float = 0.200  # 200 ms = 5 Hz
-    measurement_fps: int = 10        # target internal measurement loop rate
+    measurement_fps: int = 25     # target internal measurement loop rate
 
 
 @dataclass
@@ -162,7 +162,7 @@ class SystemConfig:
 
 
 # ── Singleton accessor ──────────────────────────────────────────────────────
-_config: SystemConfig | None = None
+_config: Optional[SystemConfig] = None
 
 
 def get_config() -> SystemConfig:

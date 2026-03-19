@@ -198,6 +198,9 @@ class WidthMeasurer:
             "LASER" if laser_mode else "SOBEL",
         )
 
+        # Diagnostic counter (prints details once)
+        self._diag_done = False
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     def measure(self, frame: np.ndarray) -> Optional[MeasurementResult]:
@@ -365,6 +368,25 @@ class WidthMeasurer:
 
         sobel = cv2.Sobel(strip, cv2.CV_64F, 1, 0, ksize=self._sobel_k)
         abs_sobel = np.abs(sobel)
+
+        # ── One-time diagnostic dump ────────────────────────────────────
+        if not self._diag_done:
+            self._diag_done = True
+            row_maxes = abs_sobel.max(axis=1)
+            log.warning(
+                "[%s] DIAG | gray shape=%s min=%d max=%d mean=%.1f | "
+                "strip shape=%s min=%d max=%d mean=%.1f | "
+                "sobel max=%.2f mean=%.2f | "
+                "rows_above_thresh=%d/%d (thresh=%.1f) | "
+                "sobel row_maxes top5=%s",
+                self._calib.camera_name,
+                gray.shape, int(gray.min()), int(gray.max()), float(gray.mean()),
+                strip.shape, int(strip.min()), int(strip.max()), float(strip.mean()),
+                float(abs_sobel.max()), float(abs_sobel.mean()),
+                int((row_maxes >= self._sobel_th).sum()), abs_sobel.shape[0],
+                self._sobel_th,
+                str(sorted(row_maxes, reverse=True)[:5]),
+            )
 
         left_cols: list[float] = []
         right_cols: list[float] = []
